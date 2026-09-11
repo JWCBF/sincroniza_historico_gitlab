@@ -27,41 +27,49 @@ def get_gitlab_activity():
     
     print(f"Buscando todas as atividades de {GITLAB_URL}...")
     
-    while True:
-        url = f"{GITLAB_URL}/api/v4/events"
-        params = {
-            "private_token": GITLAB_TOKEN,
-            "after": SINCE_DATE,
-            "per_page": 100,
-            "page": page
-        }
-        
-        try:
-            response = requests.get(url, params=params)
-            response.raise_for_status()
-            events = response.json()
-        except Exception as e:
-            print(f"Erro ao acessar GitLab: {e}")
-            break
-        
-        if not events:
-            break
+    # Usar uma sessão para reutilizar conexões e economizar memória/recursos
+    with requests.Session() as session:
+        while True:
+            url = f"{GITLAB_URL}/api/v4/events"
+            params = {
+                "private_token": GITLAB_TOKEN,
+                "after": SINCE_DATE,
+                "per_page": 100,
+                "page": page
+            }
             
-        for event in events:
-            date_str = event['created_at'].split('T')[0]
+            try:
+                # Adicionado timeout para evitar que o script fique pendurado
+                with session.get(url, params=params, timeout=30) as response:
+                    response.raise_for_status()
+                    events = response.json()
+            except Exception as e:
+                print(f"Erro ao acessar GitLab na página {page}: {e}")
+                break
             
-            # Se for push, conta os commits. Se for qualquer outra atividade (issue, comment, etc), conta como 1.
-            if event.get('action_name') in ['pushed to', 'pushed new']:
-                commit_count = event.get('push_data', {}).get('commit_count', 1)
-                # Às vezes o commit_count vem como 0 em alguns tipos de push de sistema
-                commit_count = max(commit_count, 1)
-            else:
-                commit_count = 1
+            if not events:
+                break
                 
-            activity_by_date[date_str] = activity_by_date.get(date_str, 0) + commit_count
+            for event in events:
+                if 'created_at' not in event:
+                    continue
+                date_str = event['created_at'].split('T')[0]
+                
+                # Se for push, conta os commits. Se for qualquer outra atividade (issue, comment, etc), conta como 1.
+                if event.get('action_name') in ['pushed to', 'pushed new']:
+                    commit_count = event.get('push_data', {}).get('commit_count', 1)
+                    # Às vezes o commit_count vem como 0 em alguns tipos de push de sistema
+                    commit_count = max(commit_count, 1)
+                else:
+                    commit_count = 1
+                    
+                activity_by_date[date_str] = activity_by_date.get(date_str, 0) + commit_count
+                
+            print(f"Lendo página {page}...")
+            page += 1
             
-        print(f"Lendo página {page}...")
-        page += 1
+            # Limpeza explícita para ajudar o GC se a lista de eventos for muito grande
+            del events
 
     # Filtra apenas dias que realmente tiveram atividade > 0
     return {k: v for k, v in activity_by_date.items() if v > 0}
@@ -79,10 +87,25 @@ def sync_to_github(activity):
         
         print(f"Dia {date_str}: criando {count} commits...")
         
+        # Otimização: Agrupar export de variáveis de ambiente
+        env = os.environ.copy()
+        env["GIT_AUTHOR_DATE"] = git_date
+        env["GIT_COMMITTER_DATE"] = git_date
+        
         for _ in range(count):
-            env_vars = f'export GIT_AUTHOR_DATE="{git_date}" && export GIT_COMMITTER_DATE="{git_date}"'
-            cmd = f'{env_vars} && git commit --allow-empty -m "Sync GitLab activity" --no-gpg-sign'
-            run_git_command(cmd)
+            # Usar subprocess.run de forma mais eficiente sem shell=True se possível
+            # e passando o ambiente diretamente
+            try:
+                subprocess.run(
+                    ["git", "commit", "--allow-empty", "-m", "Sync GitLab activity", "--no-gpg-sign"],
+                    check=True,
+                    cwd=GITHUB_REPO_PATH,
+                    env=env,
+                    capture_output=True # Evita poluir o console com milhares de mensagens do git
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"Erro ao criar commit para o dia {date_str}: {e}")
+                break
 
     print(f"\nFazendo push para o GitHub (branch: {BRANCH})...")
     try:
